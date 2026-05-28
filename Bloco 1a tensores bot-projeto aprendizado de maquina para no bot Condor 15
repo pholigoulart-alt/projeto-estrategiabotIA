@@ -1,0 +1,476 @@
+"""
+Roteiro de Estudo — DL Aplicado ao Bot Condor 15m Guia destrinchado por recurso. Cada item mapeia o conteúdo teórico diretamente para uma função ou decisão do Condor 15
+
+
+
+Como Usar Este Roteiro Para cada livro/artigo há três colunas mentais: O QUE estudar — capítulos/seções específicas, não o livro inteiro POR QUE importa — ligação direta com o código do bot O QUE construir — entregável concreto ao terminar cada bloco 📚 Arsenal Completo Confirmado # Recurso Edição Páginas Uso 1º Deep Learning with Python — 2ª ed. EN (Chollet) 2021 504 PRINCIPAL — use esta para tudo 1º Deep Learning with Python — 1ª ed. PT-BR (Chollet) 2018 442 Apoio: só se travar num conceito e querer ler em português 2º Deep Learning for Finance — Kaabar Jan/2024 469 Ponte DL → trading 3º AFML — López de Prado (Lectures 1–10 SSRN) 2018 gratuito Labeling, backtesting # Recurso Edição Páginas Uso 4º arXiv:2405.11431 2024 gratuito Benchmark crypto 5º ML for Asset Managers — López de Prado (Cap.1 SSRN) 2020 gratuito Refinamento ⚠ Regra de ouro: A 2ª edição EN é o guia principal do início ao fim. A 1ª edição PT-BR existe apenas como dicionário de consulta quando um conceito travar em inglês. Não misture os dois como fonte primária. 🗺 Mapeamento de Capítulos: 1ª ed. → 2ª ed. A estrutura mudou bastante entre as edições. Use esta tabela para não se perder: 1ª Ed. PT-BR Conteúdo 2ª Ed. EN ✅ Capítulo 1 O que é DL Capítulo 1 Capítulo 2 Blocos matemáticos / Tensores Capítulo 2 Capítulo 3 Primeiras redes neurais Capítulos 3 e 4 Capítulo 4 Fundamentos de ML Capítulo 5 Capítulo 5 CNNs para visão Capítulos 8 e 9 Capítulo 6 LSTM / RNN / Séries temporais Capítulo 10 ← o mais importante Capítulo 7 Boas práticas avançadas Capítulos 6, 7 e 13 Capítulo 8 DL Generativo Capítulo 12 — Workflow universal de ML (novo) Capítulo 6 — Keras deep dive (novo) Capítulo 7 — Transformers para texto (novo) Capítulo 11 � � RECURSO 1 Deep Learning with Python — François Chollet (2ª ed. EN, 2021) Use a 2ª edição EN como guia principal do início ao fim. BLOCO 1.A — Capítulos 1 e 2 "What is deep learning?" + "The mathematical building blocks" O que destrinchar: Tensores e operações tensoriais (cap. 2.2–2.3) Entender shape, dtype, reshape, dot product Praticar: criar tensor com seus dados de vela (open, high, low, close, volume, bbw, delta) Atenção: cap. 2.2 já menciona "Timeseries data or sequence data" — leia com atenção Gradiente e descida de gradiente (cap. 2.4) Não precisa derivar na mão — precisa entender O QUE o otimizador está fazendo O loop de treino completo em TensorFlow (cap. 2.5) O código aqui já usa a API moderna ( Por que importa pro bot: A função tf.GradientTape ) — diferente da 1ª edição decidir_estrategia() hoje usa regras modelo DL vai substituir esses if/else com thresholds fixos. Um if/else por pesos aprendidos. Você precisa entender que "aprender" = ajustar esses pesos via gradiente. Entregável: python # Ao terminar este bloco, você deve conseguir escrever isso do zero: import numpy as np X = np.array([[0.42, 0.65, True, 0.71], # [bbw, bbw_perc, squeeze, delta_buy] [0.28, 0.30, False, 0.48]]) y = np.array([1, 0]) # 1=UP, 0=DOWN # ...e entender o que acontece quando você passa X por uma camada densa
+
+
+
+"""
+
+import numpy as np
+import pandas as pd
+import time
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 1 — O QUE É UM TENSOR?  (Chollet 2.2)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet define tensor como: "um contêiner de dados numéricos, quase sempre
+# dados numéricos. Então, um tensor é um contêiner de números."
+#
+# Rank (grau) do tensor = número de eixos (dimensões):
+#   Rank 0 = escalar (um número)
+#   Rank 1 = vetor   (lista de números)
+#   Rank 2 = matriz  (tabela de números)
+#   Rank 3 = cubo    (pilha de matrizes) ← nosso caso: (samples, timesteps, features)
+#
+# NO BOT:
+#   Cada VELA 15m é um vetor de features: [open, high, low, close, volume, bbw, delta_buy]
+#   Uma JANELA de 50 velas = matriz shape (50, 7)
+#   Um LOTE de 32 janelas  = tensor rank-3 shape (32, 50, 7)  ← o que a LSTM vai receber
+
+print("=" * 70)
+print("  BLOCO 1.A — Tensores e o Bot de Trading")
+print("=" * 70)
+
+
+# ─── 1.1 Escalares, vetores e matrizes ───────────────────────────────────────
+
+escalar = np.float32(0.71)          # delta_buy de uma vela qualquer
+print(f"\n[1.1] ESCALAR  | ndim={escalar.ndim}  shape={escalar.shape}  valor={escalar}")
+# → ndim=0, shape=() — zero eixos. É só um número.
+
+vetor_vela = np.array(
+    [42150.00, 42310.00, 42080.00, 42275.00,  # open, high, low, close
+      1234.56,                                  # volume
+      0.0423,                                   # bbw (Bollinger Band Width)
+      0.71],                                    # delta_buy (fração compradora)
+    dtype=np.float32
+)
+print(f"\n[1.2] VETOR VELA  | ndim={vetor_vela.ndim}  shape={vetor_vela.shape}")
+print(f"      [open, high, low, close, volume, bbw, delta_buy]")
+print(f"       {vetor_vela}")
+# → ndim=1, shape=(7,). É UMA VELA representada como vetor de 7 features.
+
+
+# ─── 1.2 Tensor Rank-2: uma janela de velas ──────────────────────────────────
+# Chollet 2.2.8: "Timeseries data → Rank-3 tensor of shape (samples, timesteps, features)"
+# Aqui construímos primeiro o rank-2 de UMA janela (sem batch):
+# shape = (timesteps, features) = (50, 7)
+
+np.random.seed(42)  # reprodutibilidade
+
+N_TIMESTEPS = 50  # 50 velas × 15min = 12.5 horas de contexto
+N_FEATURES  = 7   # [open, high, low, close, volume, bbw, delta_buy]
+
+# Simula uma janela realista de BTC: preço em torno de 42.000, bbw ~0.04, delta ~0.5
+janela_btc = np.zeros((N_TIMESTEPS, N_FEATURES), dtype=np.float32)
+preco_base = 42_000.0
+for i in range(N_TIMESTEPS):
+    # Caminha aleatória para simular a série de preços
+    preco_base += np.random.normal(0, 150)
+    open_  = preco_base
+    close  = preco_base + np.random.normal(0, 80)
+    high   = max(open_, close) + abs(np.random.normal(0, 40))
+    low    = min(open_, close) - abs(np.random.normal(0, 40))
+    vol    = np.random.uniform(800, 2000)
+    bbw    = np.random.uniform(0.020, 0.080)
+    delta  = np.random.uniform(0.30, 0.75)
+    janela_btc[i] = [open_, high, low, close, vol, bbw, delta]
+
+print(f"\n[1.3] JANELA (Rank-2) | ndim={janela_btc.ndim}  shape={janela_btc.shape}")
+print(f"      Uma janela de {N_TIMESTEPS} velas × {N_FEATURES} features")
+print(f"      Primeira vela : {janela_btc[0].round(4)}")
+print(f"      Última  vela  : {janela_btc[-1].round(4)}")
+# → shape=(50, 7). Cada LINHA é uma vela. Cada COLUNA é uma feature.
+
+# ─── 1.3 Tensor Rank-3: LOTE de janelas ──────────────────────────────────────
+# Chollet p.36: "Timeseries data: (samples, timesteps, features)"
+# Aqui, samples = quantas janelas no lote de treino.
+# Para o LSTM do bot:  (batch_size, 50, 7)
+
+BATCH_SIZE = 32  # Chollet usa batch=128 no MNIST; para séries financeiras, 32 é comum
+
+lote_janelas = np.stack([
+    janela_btc + np.random.normal(0, 50, janela_btc.shape).astype(np.float32)
+    for _ in range(BATCH_SIZE)
+], axis=0)
+
+print(f"\n[1.4] LOTE (Rank-3)   | ndim={lote_janelas.ndim}  shape={lote_janelas.shape}")
+print(f"      = ({BATCH_SIZE} amostras, {N_TIMESTEPS} timesteps, {N_FEATURES} features)")
+print(f"      É EXATAMENTE o shape que a LSTM recebe: input_shape=(50, 7)")
+print(f"      Memória usada: {lote_janelas.nbytes / 1024:.1f} KB")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 2 — NORMALIZAÇÃO DOS TENSORES  (Chollet 2.2 + 10.2.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet avisa: "each timeseries is on a different scale"
+# Open/Close estão em dezenas de milhares; bbw em centésimos; delta em [0,1].
+# Sem normalização, a camada Dense vai tratar "42000" como 1 MILHÃO de vezes
+# mais importante que "0.042". O gradiente vai explodir.
+#
+# NO BOT: normalizamos POR FEATURE (eixo 0 = amostras de treino), NÃO por vela.
+# Importante: calculamos média/std APENAS no conjunto de treino e aplicamos
+# no de validação/teste. Nunca o contrário (isso seria look-ahead bias).
+
+print(f"\n{'=' * 70}")
+print("  SEÇÃO 2 — Normalização (por feature, calculada no treino)")
+print("=" * 70)
+
+# Calcula média e desvio-padrão por feature (eixo 0 = amostras, eixo 1 = timesteps)
+# Shape: mean/std terão shape (N_FEATURES,) após reduzir eixos 0 e 1
+mean_features = lote_janelas.mean(axis=(0, 1))   # shape (7,)
+std_features  = lote_janelas.std(axis=(0, 1))    # shape (7,)
+std_features  = np.where(std_features == 0, 1.0, std_features)  # evita div/0
+
+lote_normalizado = (lote_janelas - mean_features) / std_features
+
+feature_names = ["open", "high", "low", "close", "volume", "bbw", "delta_buy"]
+print(f"\n{'Feature':<12} {'Média (raw)':>14} {'Std (raw)':>12} "
+      f"{'Média (norm)':>14} {'Std (norm)':>12}")
+print("-" * 70)
+for i, nome in enumerate(feature_names):
+    mn = lote_normalizado[:, :, i].mean()
+    st = lote_normalizado[:, :, i].std()
+    print(f"  {nome:<10} {mean_features[i]:>14.2f} {std_features[i]:>12.2f} "
+          f"{mn:>14.4f} {st:>12.4f}")
+
+print(f"\n⚠️  IMPORTANTE: essa mesma mean_features e std_features devem ser")
+print(f"   salvas em disco e reutilizadas na inferência do bot (T-10s).")
+print(f"   Se recalcular com dados novos → os pesos do modelo não funcionam.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 3 — OPERAÇÕES TENSORIAIS  (Chollet 2.3)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 2.3: "output = relu(dot(input, W) + b)"
+# Toda camada Dense é essa equação. Vamos ver ela acontecer com os dados do bot.
+
+print(f"\n{'=' * 70}")
+print("  SEÇÃO 3 — Operações Tensoriais: o que acontece dentro de uma Dense")
+print("=" * 70)
+
+# Pega UMA janela normalizada, última vela (o "vetor de features atual")
+uma_vela = lote_normalizado[0, -1, :]   # shape (7,) — última vela do 1º exemplo
+print(f"\n[3.1] Uma vela normalizada (shape={uma_vela.shape}):")
+for nome, val in zip(feature_names, uma_vela):
+    print(f"      {nome:<12}: {val:+.4f}")
+
+# Simula uma camada Dense(64): W shape (7, 64), b shape (64,)
+np.random.seed(0)
+W = np.random.randn(7, 64).astype(np.float32) * 0.1  # inicialização pequena
+b = np.zeros(64, dtype=np.float32)
+
+# Forward pass manual: output = relu(dot(input, W) + b)
+pre_ativacao = np.dot(uma_vela, W) + b   # shape (64,)
+relu_output  = np.maximum(pre_ativacao, 0)  # relu: max(x, 0)
+
+print(f"\n[3.2] Dense(64) manual — relu(dot(vela, W) + b):")
+print(f"      vela shape : {uma_vela.shape}")
+print(f"      W shape    : {W.shape}")
+print(f"      b shape    : {b.shape}")
+print(f"      saída shape: {relu_output.shape}")
+print(f"      Neurônios ativos (> 0): {(relu_output > 0).sum()}/64")
+print(f"      Isso é exatamente o que layers.Dense(64, activation='relu') faz.")
+
+# Por que relu?  Chollet 2.3.6: sem relu, N camadas Dense = 1 camada Dense.
+# A não-linearidade é o que dá poder ao modelo para aprender padrões complexos.
+print(f"\n[3.3] Por que relu importa:")
+saida_linear = np.dot(uma_vela, W) + b              # sem relu
+print(f"      Sem relu (linear): valores em [{saida_linear.min():.3f}, {saida_linear.max():.3f}]")
+print(f"      Com relu         : valores em [{relu_output.min():.3f}, {relu_output.max():.3f}]")
+print(f"      relu 'dobra o espaço' — cria a não-linearidade que permite aprender")
+print(f"      padrões como: 'squeeze + delta alto → UP' (Bloco 1.C com LSTM)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 4 — GRADIENTE E DESCIDA DE GRADIENTE  (Chollet 2.4)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 2.4: "move the parameters a little in the opposite direction from
+# the gradient — W -= learning_rate * gradient — thus reducing the loss."
+#
+# NO BOT: hoje os thresholds DELTA_THRESHOLD=0.70 e BBW_SQUEEZE_PERCENTIL=20
+# são fixos (if/else hardcoded). O DL vai APRENDER esses thresholds.
+# "Aprender" = ajustar os pesos W via gradiente até o loss cair.
+
+print(f"\n{'=' * 70}")
+print("  SEÇÃO 4 — Gradiente: como 'aprender' funciona")
+print("=" * 70)
+
+# Analogia direta com o bot:
+# - REGRA ATUAL: if squeeze and delta >= 0.70: decisao = "SNIPER_UP"
+#   → threshold 0.70 é FIXO, escolhido por intuição
+# - COM DL: o modelo aprende AUTOMATICAMENTE o peso equivalente a esse threshold
+#   → o gradiente "empurra" os pesos na direção que reduz o erro de classificação
+
+print("""
+  Analogia visual — Descida de Gradiente (SGD):
+
+  LOSS
+   ↑
+  0.8 |  *
+  0.6 |    *
+  0.4 |       *
+  0.2 |           *
+  0.1 |               * ← mínimo (pesos ótimos)
+      +─────────────────────→ PESOS (W)
+                 ↑
+           Aqui o gradiente = 0 (chegamos no mínimo)
+
+  A cada batch de velas:
+    1. Forward pass: modelo prevê UP/DOWN
+    2. Compara com o resultado real da vela (oráculo Binance)
+    3. Calcula LOSS (quão errado estava)
+    4. Backprop: calcula gradiente (direção para reduzir loss)
+    5. W -= learning_rate * gradiente  (atualiza pesos)
+""")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 5 — LOOP DE TREINO COMPLETO COM GradientTape  (Chollet 2.5)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 2.5: implementação "from scratch" do loop de treino.
+# Aqui adaptamos para os dados do bot: classificação binária UP/DOWN.
+# API moderna: from tensorflow import keras (NÃO from keras.models import...)
+
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+
+    print(f"\n{'=' * 70}")
+    print("  SEÇÃO 5 — Loop de treino com GradientTape (TF 2.x moderno)")
+    print("=" * 70)
+    print(f"  TensorFlow versão: {tf.__version__}")
+
+    # ─── 5.1 Cria dataset sintético realista ─────────────────────────────────
+    # Simula radar_velas.csv com regra conhecida para validar que o modelo aprende:
+    # REGRA: se delta_buy (feature 6) >= 0.60 E bbw_perc (feature 5) >= 0.03 → UP
+    # (simplificação da lógica real do bot para fins didáticos)
+
+    N_AMOSTRAS = 2000   # Mais que radar_velas.csv terá inicialmente — ideal seria >5000
+    JANELA     = 10     # Janela de 10 velas para este demo (Bloco 1.C usará 50)
+    N_FEAT     = 7
+
+    np.random.seed(123)
+    X_raw = np.random.randn(N_AMOSTRAS, JANELA, N_FEAT).astype(np.float32)
+    # Regra sintética: última vela, feature 6 (delta) e feature 5 (bbw)
+    delta_ultima = X_raw[:, -1, 6]
+    bbw_ultima   = X_raw[:, -1, 5]
+    y = ((delta_ultima > 0.15) & (bbw_ultima > 0.0)).astype(np.float32)
+
+    # Normalização (SEMPRE antes de passar ao modelo)
+    mean_ = X_raw.mean(axis=(0, 1), keepdims=True)
+    std_  = X_raw.std(axis=(0, 1), keepdims=True) + 1e-8
+    X_norm = (X_raw - mean_) / std_
+
+    # Split temporal: NUNCA embaralhar dados de série temporal!
+    # Chollet 10.2: "validation/test must be MORE RECENT than training data"
+    n_train = int(0.70 * N_AMOSTRAS)
+    n_val   = int(0.15 * N_AMOSTRAS)
+    X_train, y_train = X_norm[:n_train],           y[:n_train]
+    X_val,   y_val   = X_norm[n_train:n_train+n_val], y[n_train:n_train+n_val]
+    X_test,  y_test  = X_norm[n_train+n_val:],     y[n_train+n_val:]
+
+    print(f"\n[5.1] Dataset:")
+    print(f"      Train   : {X_train.shape}  |  UP={y_train.mean()*100:.0f}%")
+    print(f"      Val     : {X_val.shape}    |  UP={y_val.mean()*100:.0f}%")
+    print(f"      Test    : {X_test.shape}   |  UP={y_test.mean()*100:.0f}%")
+    print(f"      Split temporal: train < val < test (sem vazamento)")
+
+    # ─── 5.2 Modelo Dense simples (entregável do Bloco 1.B) ──────────────────
+    # Nota: para timeseries o correto é LSTM (Bloco 1.C).
+    # Aqui usamos Dense para demonstrar os conceitos do Cap. 2 (cap. 3-5 usa Dense,
+    # cap. 10 migra para LSTM/GRU).
+
+    # Achata a janela: (batch, 10, 7) → (batch, 70) para a camada Dense
+    X_train_flat = X_train.reshape(X_train.shape[0], -1)   # (1400, 70)
+    X_val_flat   = X_val.reshape(X_val.shape[0], -1)       # (300, 70)
+    X_test_flat  = X_test.reshape(X_test.shape[0], -1)     # (300, 70)
+
+    # API moderna Chollet 2ª ed.: from tensorflow import keras
+    model = keras.Sequential([
+        # input_shape=(70,) = 10 velas × 7 features (achatado)
+        layers.Dense(64, activation='relu', input_shape=(JANELA * N_FEAT,)),
+        # Dropout: Chollet 5.2.3 — "use sempre para dados financeiros"
+        layers.Dropout(0.3),
+        layers.Dense(32, activation='relu'),
+        layers.Dropout(0.3),
+        # Saída: sigmoid → probabilidade de UP (valor entre 0 e 1)
+        layers.Dense(1, activation='sigmoid'),
+    ], name="modelo_bloco1a_bot")
+
+    model.compile(
+        optimizer='adam',             # Adam = SGD com momentum adaptativo
+        loss='binary_crossentropy',   # loss para classificação binária UP/DOWN
+        metrics=['accuracy'],
+    )
+
+    print(f"\n[5.2] Arquitetura:")
+    model.summary()
+
+    # ─── 5.3 Loop de treino (Chollet 2.5) ────────────────────────────────────
+    # model.fit() encapsula o loop descrito na seção 2.4-2.5:
+    #   1. Sorteia batch de amostras
+    #   2. Forward pass → previsão
+    #   3. Calcula loss (binary_crossentropy)
+    #   4. GradientTape → backprop → gradiente
+    #   5. Adam → atualiza pesos: W -= lr * gradiente
+
+    print(f"\n[5.3] Treinando...")
+    t0 = time.time()
+    historico = model.fit(
+        X_train_flat, y_train,
+        epochs=20,
+        batch_size=32,
+        validation_data=(X_val_flat, y_val),
+        verbose=0,            # silencioso — imprimimos nosso próprio resumo
+    )
+    elapsed = time.time() - t0
+
+    # ─── 5.4 Resultado ───────────────────────────────────────────────────────
+    val_loss   = historico.history['val_loss'][-1]
+    val_acc    = historico.history['val_accuracy'][-1]
+    train_acc  = historico.history['accuracy'][-1]
+
+    test_loss, test_acc = model.evaluate(X_test_flat, y_test, verbose=0)
+
+    print(f"\n[5.4] Resultado do treino ({elapsed:.1f}s):")
+    print(f"      Train  accuracy : {train_acc*100:.1f}%")
+    print(f"      Val    accuracy : {val_acc*100:.1f}%")
+    print(f"      Test   accuracy : {test_acc*100:.1f}%")
+    print(f"      Test   loss     : {test_loss:.4f}")
+
+    # Gap train vs val: diagnóstico de overfitting (Chollet 5.1)
+    gap = train_acc - val_acc
+    if gap > 0.10:
+        diag = "⚠️  OVERFITTING — modelo decorou o treino. Aumente Dropout ou reduza camadas."
+    elif val_acc > train_acc:
+        diag = "✅  Underfitting leve — normal em poucas épocas. Treine mais."
+    else:
+        diag = "✅  Boa generalização — gap treino/val aceitável."
+    print(f"      Gap train/val   : {gap*100:+.1f}% → {diag}")
+
+    # ─── 5.5 GradientTape explícito (Chollet 2.5.1) ──────────────────────────
+    # Mostra o que model.fit() faz "debaixo do capô"
+    print(f"\n[5.5] GradientTape — o que model.fit() faz em cada batch:")
+
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
+
+    # Um batch de 4 amostras do treino (didático — batch real seria 32)
+    x_batch = tf.constant(X_train_flat[:4])
+    y_batch = tf.constant(y_train[:4].reshape(-1, 1))
+
+    with tf.GradientTape() as tape:
+        # 1. Forward pass: modelo prevê probabilidade de UP
+        y_pred = model(x_batch, training=True)
+        # 2. Calcula loss: quão erradas estão as previsões
+        loss_val = keras.losses.binary_crossentropy(y_batch, y_pred)
+        loss_val = tf.reduce_mean(loss_val)
+
+    # 3. Backprop: GradientTape calcula ∂loss/∂W para TODOS os pesos de uma vez
+    gradients = tape.gradient(loss_val, model.trainable_variables)
+
+    # 4. Optimizer atualiza: W -= lr * gradiente  (Adam ajusta o lr por variável)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+    print(f"      Loss neste batch: {loss_val:.4f}")
+    print(f"      Número de tensores de gradiente: {len(gradients)}")
+    print(f"      (um por tensor de pesos — {sum(1 for v in model.trainable_variables)} variáveis treináveis)")
+    print(f"      Norma do gradiente da 1ª camada: {tf.norm(gradients[0]):.4f}")
+
+    # ─── 5.6 Inferência simulando o T-10s do bot ─────────────────────────────
+    print(f"\n[5.6] Inferência simulando o coordinator_radar() no T-10s:")
+
+    uma_janela = X_test_flat[[0]]   # shape (1, 70)
+    t_inf = time.time()
+    prob_up = float(model.predict(uma_janela, verbose=0)[0, 0])
+    t_inf = (time.time() - t_inf) * 1000
+
+    if prob_up >= 0.55:
+        decisao = "SNIPER_UP"
+    elif prob_up <= 0.45:
+        decisao = "SNIPER_DOWN"
+    else:
+        decisao = "SEM_SINAL"   # zona de incerteza → não opera
+
+    print(f"      P(UP)     = {prob_up:.4f}  ({prob_up*100:.1f}%)")
+    print(f"      Decisão   = {decisao}")
+    print(f"      Latência  = {t_inf:.2f}ms  (limite do bot: < 100ms)")
+    assert t_inf < 100, f"Latência {t_inf:.0f}ms excede o limite do bot!"
+    print(f"      ✅ Dentro do limite de 100ms do coordinator_radar()")
+
+except ImportError:
+    print(f"\n⚠️  TensorFlow não instalado neste ambiente.")
+    print(f"   Execute: pip install tensorflow")
+    print(f"   Ou use Google Colab — código está pronto para copiar e rodar.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 6 — O ENTREGÁVEL DO BLOCO 1.A
+# ══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n{'=' * 70}")
+print("  SEÇÃO 6 — Entregável: tensor com dados de vela (sem TF)")
+print("=" * 70)
+
+# Isso é o que o roteiro pede: escrever DO ZERO com os dados do bot
+X_demo = np.array([
+    #  open      high      low     close    volume   bbw      delta_buy
+    [42150.0, 42310.0, 42080.0, 42275.0,  1234.56,  0.0423,  0.71],  # squeeze + compra forte → UP
+    [41900.0, 41950.0, 41750.0, 41800.0,   876.23,  0.0389,  0.28],  # squeeze + venda forte → DOWN
+    [42500.0, 42800.0, 42100.0, 42600.0,  3456.78,  0.0821,  0.52],  # sem squeeze → MALHA
+], dtype=np.float32)
+
+y_demo = np.array([1, 0, 0], dtype=np.float32)   # 1=UP, 0=DOWN/MALHA (para fins didáticos)
+
+print(f"\n  X_demo.shape = {X_demo.shape}   (3 amostras × 7 features)")
+print(f"  y_demo       = {y_demo}  (1=UP, 0=DOWN)")
+print(f"  dtype        = {X_demo.dtype}")
+print(f"\n  Colunas: {feature_names}")
+print(f"\n  X_demo:")
+for i, (row, label) in enumerate(zip(X_demo, y_demo)):
+    nome_label = "UP" if label == 1 else "DOWN/SEM_SINAL"
+    print(f"    Amostra {i}: {row}  → {nome_label}")
+
+print(f"\n  Quando empilhamos N janelas de 50 velas:")
+print(f"  X_lstm = X_demo.reshape(N, 50, 7)  → shape=(N, 50, 7)  ← input da LSTM")
+print(f"  Esse é o tensor que a LSTM do Bloco 1.C vai receber.")
+
+print(f"""
+{'=' * 70}
+  RESUMO BLOCO 1.A — O que você aprendeu (conectado ao bot)
+{'=' * 70}
+
+  Cap. 1  — ML inverte a programação clássica:
+    ANTES: if squeeze and delta >= 0.70 → "SNIPER_UP"  (regra manual)
+    DEPOIS: o modelo APRENDE esse threshold dos dados históricos
+
+  Cap. 2.2 — Tensores:
+    Escalar  : delta_buy = 0.71
+    Vetor    : uma_vela  = [open, high, low, close, vol, bbw, delta]  shape=(7,)
+    Matriz   : janela    = 50 velas de features                       shape=(50, 7)
+    Rank-3   : lote      = 32 janelas para treinar                    shape=(32, 50, 7)
+               ↑ esse é o input_shape do LSTM que você vai construir no Bloco 1.C
+
+  Cap. 2.3 — Operações:
+    output = relu(dot(vela, W) + b)  ← o que cada camada Dense faz
+    relu cria não-linearidade → permite aprender "se squeeze E delta alto"
+
+  Cap. 2.4 — Gradiente:
+    DELTA_THRESHOLD = 0.70 hoje é fixo
+    Com DL, o equivalente a esse threshold é um PESO W ajustado via gradiente
+    W -= learning_rate * ∂loss/∂W  (Adam faz isso automaticamente)
+
+  Cap. 2.5 — GradientTape:
+    model.fit() encapsula o loop: forward → loss → backprop → update
+    model.predict() roda o forward pass em < 100ms (testado acima)
+
+  PRÓXIMO PASSO — Bloco 1.B (Caps. 3-5):
+    → Estruturar pipeline completo com radar_velas.csv real
+    → Classificador binário UP/DOWN com Dense + Dropout
+    → K-fold temporal + diagnóstico de overfitting com dados reais
+{'=' * 70}
+""")
