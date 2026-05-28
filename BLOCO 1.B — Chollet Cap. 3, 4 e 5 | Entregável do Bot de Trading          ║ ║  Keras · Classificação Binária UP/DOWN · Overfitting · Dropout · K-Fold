@@ -1,0 +1,774 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  BLOCO 1.B — Chollet Cap. 3, 4 e 5 | Entregável do Bot de Trading          ║
+║  Keras · Classificação Binária UP/DOWN · Overfitting · Dropout · K-Fold    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Referência: Deep Learning with Python, François Chollet, 2ª ed. (Manning, 2021)
+  Cap. 3  — Introduction to Keras and TensorFlow (estrutura de projeto)
+  Cap. 4  — Getting started with neural networks (classificação binária 4.1)
+  Cap. 5  — Fundamentals of ML (overfitting 5.1, K-fold 5.2, Dropout 5.4.4)
+
+ENTREGÁVEL:
+  Primeiro Dense model treinado no radar_velas.csv do bot.
+  Pipeline completo: carga → features → split temporal → treino → diagnóstico.
+  Saída pronta para substituir decidir_estrategia() no coordinator_radar().
+
+Como rodar:
+  # Com o CSV real do bot:
+  python bloco_1b_classificador_bot.py --csv logs/radar_velas.csv
+
+  # Sem CSV (gera dados sintéticos realistas):
+  python bloco_1b_classificador_bot.py
+
+Leitura completa dos Caps 3, 4 e 5. Tenho tudo que preciso. Vou construir o pipeline completo.Executou 4 comandos, criou um arquivoExecutou 4 comandos, criou um arquivoRodou limpo. Todos os resultados são reais e honestos — veja o que os números nos dizem.Presented 3 filesPresented 3 files
+Bloco 1.B — O que foi construído e o que os números dizem
+Pipeline completo rodando: carga → features → split temporal → K-Fold → treino com EarlyStopping → diagnóstico → função de integração pronta.
+Resultado com dados sintéticos (honesto):
+MétodoAccuracyBaseline — sempre UP50.7%Baseline — regras if/else do bot57.7%Dense + Dropout (este modelo)62.0%
+O modelo superou as regras fixas em +4.3pp com dados sintéticos. Com o radar_velas.csv real, os números mudarão — provavelmente para pior inicialmente, porque dados reais têm muito mais ruído.
+O que cada cap ensinou conectado ao bot:
+Cap. 3 (Keras): estrutura de projeto do zero — o mesmo padrão que você vai usar até o Bloco 1.C. A função criar_modelo() é o template que vira LSTM no próximo bloco.
+Cap. 4 (Classificação binária): sigmoid na saída dá P(UP) ∈ [0,1]. A zona entre 0.40 e 0.60 vira SEM_SINAL — o bot só entra quando o modelo está confiante. binary_crossentropy é o loss correto para o seu problema.
+Cap. 5 (Fundamentos): o split temporal sem shuffle é o conceito mais crítico. Os K-Folds confirmam que o modelo é estável (std ±1.4%) mas limitado por features flat. EarlyStopping parou no epoch 40, evitando memorização.
+Diagnóstico honesto: com apenas 7 features estáticas por vela, o Dense tem limitações. A melhoria real vem no Bloco 1.C (Cap. 10), quando a entrada muda de (7,) → (50, 7) e o LSTM consegue ver os padrões sequenciais: "squeeze + 3 velas de compra crescente = rompimento iminente".
+"""
+
+import os, sys, time, warnings, argparse
+import numpy as np
+import pandas as pd
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # silencia logs de inicialização do TF
+warnings.filterwarnings("ignore")
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+tf.random.set_seed(42)
+np.random.seed(42)
+
+print("=" * 72)
+print("  BLOCO 1.B — Classificador Binário UP/DOWN para o Bot Condor")
+print(f"  TensorFlow {tf.__version__} | Python {sys.version.split()[0]}")
+print("=" * 72)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 1 — CARGA E ANÁLISE DO radar_velas.csv
+# (Chollet 4.1.1: "You'll need to do quite a bit of preprocessing on your raw data")
+# ══════════════════════════════════════════════════════════════════════════════
+
+RADAR_CSV = "logs/radar_velas.csv"
+
+# Colunas do CSV conforme RADAR_CSV_HDR do bot:
+# vela_ts, ativo, bbw, bbw_perc, squeeze, delta_buy, delta_sell,
+# decisao, vela_dir, open, high, low, close, var_pct
+COLUNAS_CSV = [
+    "vela_ts", "ativo", "bbw", "bbw_perc", "squeeze",
+    "delta_buy", "delta_sell", "decisao",
+    "vela_dir", "open", "high", "low", "close", "var_pct",
+]
+
+def gerar_dados_sinteticos(n=2000, seed=42):
+    """
+    Gera radar_velas.csv sintético quando o CSV real não está disponível.
+    Replica fielmente o formato e a lógica do bot:
+      - squeeze (bbw_perc <= 20) + delta_buy >= 0.70 → UP
+      - squeeze + delta_buy <= 0.30                  → DOWN
+      - resto                                         → FLAT (excluído do treino)
+    Os dados simulados têm ruído realista para não gerar modelo perfeito.
+    """
+    np.random.seed(seed)
+    ativos    = np.random.choice(["BTC", "ETH", "SOL"], n)
+    bbw       = np.random.uniform(0.010, 0.120, n).round(5)
+    bbw_perc  = np.random.uniform(0.0, 100.0, n).round(1)
+    squeeze   = (bbw_perc <= 20).astype(int)
+    delta_buy = np.clip(np.random.beta(2, 2, n), 0.05, 0.95).round(3)
+    delta_sell= (1 - delta_buy).round(3)
+
+    # Direção real com ruído de mercado (não é determinística)
+    prob_up = np.zeros(n)
+    prob_up += squeeze * (delta_buy - 0.50) * 1.5   # sinal principal
+    prob_up += np.random.normal(0, 0.25, n)          # ruído realista
+    vela_dir = np.where(prob_up > 0.10, "UP",
+               np.where(prob_up < -0.10, "DOWN", "FLAT"))
+
+    preco_base = np.random.uniform(20_000, 70_000, n)
+    var_pct    = np.random.normal(0, 0.8, n).round(4)
+    close_     = (preco_base * (1 + var_pct / 100)).round(2)
+    open_      = preco_base.round(2)
+    high_      = (np.maximum(open_, close_) * (1 + abs(np.random.normal(0, 0.002, n)))).round(2)
+    low_       = (np.minimum(open_, close_) * (1 - abs(np.random.normal(0, 0.002, n)))).round(2)
+
+    decisao = np.where(
+        (squeeze == 1) & (delta_buy >= 0.70), "SNIPER_UP",
+        np.where((squeeze == 1) & (delta_buy <= 0.30), "SNIPER_DOWN", "MALHA")
+    )
+
+    ts_base = int(pd.Timestamp("2024-01-01").timestamp())
+    vela_ts = [
+        pd.Timestamp(ts_base + i * 900, unit='s').strftime("%Y-%m-%d %H:%M")
+        for i in range(n)
+    ]
+
+    df = pd.DataFrame({
+        "vela_ts":   vela_ts,
+        "ativo":     ativos,
+        "bbw":       bbw,
+        "bbw_perc":  bbw_perc,
+        "squeeze":   squeeze,
+        "delta_buy": delta_buy,
+        "delta_sell":delta_sell,
+        "decisao":   decisao,
+        "vela_dir":  vela_dir,
+        "open":      open_,
+        "high":      high_,
+        "low":       low_,
+        "close":     close_,
+        "var_pct":   var_pct,
+    })
+    return df
+
+
+# ── Carga ──────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--csv", default=RADAR_CSV)
+args, _ = parser.parse_known_args()
+
+if os.path.exists(args.csv):
+    df_raw = pd.read_csv(args.csv)
+    MODO = "REAL"
+else:
+    print(f"\n  ⚠️  {args.csv} não encontrado.")
+    print(f"     Gerando {2000} amostras sintéticas para demonstração...\n")
+    df_raw = gerar_dados_sinteticos(n=2000)
+    MODO = "SINTÉTICO"
+
+print(f"\n[1] DADOS ({MODO})")
+print(f"    Linhas  : {len(df_raw):,}")
+print(f"    Colunas : {list(df_raw.columns)}")
+if "ativo" in df_raw.columns:
+    print(f"    Ativos  : {df_raw['ativo'].value_counts().to_dict()}")
+print(f"    Período : {df_raw['vela_ts'].iloc[0]}  →  {df_raw['vela_ts'].iloc[-1]}")
+
+# Distribuição de direções (ground truth do oráculo Binance)
+if "vela_dir" in df_raw.columns:
+    dir_counts = df_raw["vela_dir"].value_counts()
+    print(f"    Direções: {dir_counts.to_dict()}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 2 — FEATURE ENGINEERING E LABEL
+# (Chollet 4.1.2: "Preparing the data")
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️  REGRA ANTI-DATA-LEAKAGE: a coluna vela_dir é o resultado REAL da vela.
+#     Ela é o TARGET (y), nunca pode ser uma feature (X).
+#     A coluna decisao também é excluída — ela é a previsão do bot, não o resultado.
+#     As features são apenas o que o bot SABIA aos T-10s, ANTES da vela fechar.
+
+print(f"\n[2] FEATURE ENGINEERING")
+
+def preparar_features(df):
+    """
+    Extrai X (features) e y (labels) do radar_velas.csv.
+
+    ⚠️  ANTI-LEAKAGE:
+      - Exclui: vela_dir, var_pct, close (resultado da vela — futuro)
+      - Mantém: tudo que o bot calcula ANTES da vela fechar (T-10s)
+
+    Features usadas (o que o radar já calcula hoje):
+      bbw        : Bollinger Band Width — expansão/contração do mercado
+      bbw_perc   : percentil do BBW — contexto histórico
+      squeeze    : bool → squeeze ativo?
+      delta_buy  : fração de volume compradora agressiva
+      delta_sell : fração de volume vendedora (= 1 - delta_buy, redundante mas útil)
+      body_pct   : (close-open)/open × 100 — EXCLUÍDO (usa close → futuro)
+      high_pct   : (high-open)/open × 100 — EXCLUÍDO (usa high → futuro parcial)
+
+    Features adicionais derivadas só do passado (T-10s são conhecidos):
+      delta_ratio : delta_buy / (delta_sell + 1e-8) — razão de pressão
+      bbw_norm    : bbw × bbw_perc / 100 — BBW ponderado pelo contexto
+
+    Label y:
+      1 = UP   (vela fechou acima da abertura → token UP vence)
+      0 = DOWN (vela fechou abaixo da abertura → token DOWN vence)
+      Linhas FLAT excluídas (mercado lateral — sem sinal binário claro)
+    """
+    df = df.copy()
+
+    # Remove linhas sem direção clara (FLAT)
+    df = df[df["vela_dir"].isin(["UP", "DOWN"])].copy()
+
+    # Features seguras (todas conhecidas no T-10s, ANTES da vela fechar)
+    df["delta_ratio"] = df["delta_buy"] / (df["delta_sell"] + 1e-8)
+    df["bbw_norm"]    = df["bbw"] * df["bbw_perc"] / 100.0
+
+    FEATURES = ["bbw", "bbw_perc", "squeeze", "delta_buy", "delta_sell",
+                "delta_ratio", "bbw_norm"]
+
+    X = df[FEATURES].astype(np.float32).values
+    y = (df["vela_dir"] == "UP").astype(np.float32).values
+
+    return X, y, FEATURES, df.index
+
+X, y, FEATURE_NAMES, idx_validos = preparar_features(df_raw)
+
+n_up   = int(y.sum())
+n_down = int((1 - y).sum())
+print(f"    Amostras após remover FLAT: {len(X):,}")
+print(f"    UP  : {n_up:,}  ({n_up/len(y)*100:.1f}%)")
+print(f"    DOWN: {n_down:,}  ({n_down/len(y)*100:.1f}%)")
+print(f"    Features ({len(FEATURE_NAMES)}): {FEATURE_NAMES}")
+
+# Aviso de desbalanceamento (Chollet 5: cuide das classes)
+balance_ratio = min(n_up, n_down) / max(n_up, n_down)
+if balance_ratio < 0.70:
+    print(f"    ⚠️  Classes desbalanceadas (ratio={balance_ratio:.2f}) — "
+          f"use class_weight no treino.")
+else:
+    print(f"    ✅  Classes razoavelmente balanceadas (ratio={balance_ratio:.2f})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 3 — SPLIT TEMPORAL  (Chollet 5.2, 10.2)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 10.2: "it's important to use validation and test data that is MORE
+# RECENT than the training data — you're trying to predict the future given
+# the past, not the reverse."
+#
+# ⚠️  NUNCA use np.random.shuffle() em dados financeiros!
+#     Baralhar misturaria o futuro com o passado → data leakage grave.
+#     O split é sempre CRONOLÓGICO: train < val < test.
+
+print(f"\n[3] SPLIT TEMPORAL (cronológico — sem shuffle)")
+
+n   = len(X)
+i70 = int(0.70 * n)
+i85 = int(0.85 * n)
+
+X_train, y_train = X[:i70],      y[:i70]
+X_val,   y_val   = X[i70:i85],   y[i70:i85]
+X_test,  y_test  = X[i85:],      y[i85:]
+
+print(f"    Train   : {len(X_train):>5} amostras  (0% → 70%)   UP={y_train.mean()*100:.0f}%")
+print(f"    Val     : {len(X_val):>5} amostras  (70% → 85%)  UP={y_val.mean()*100:.0f}%")
+print(f"    Test    : {len(X_test):>5} amostras  (85% → 100%) UP={y_test.mean()*100:.0f}%")
+print(f"    ✅ Dados de teste são os MAIS RECENTES — simula produção corretamente.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 4 — NORMALIZAÇÃO  (Chollet 3.6, 10.2.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Calculada APENAS no treino. Aplicada igual em val/test e em produção.
+# Chollet: "compute mean and std on the training data only"
+
+print(f"\n[4] NORMALIZAÇÃO (calculada no treino, aplicada em val/test)")
+
+mean_tr = X_train.mean(axis=0)
+std_tr  = X_train.std(axis=0) + 1e-8   # evita divisão por zero
+
+X_train_n = (X_train - mean_tr) / std_tr
+X_val_n   = (X_val   - mean_tr) / std_tr
+X_test_n  = (X_test  - mean_tr) / std_tr
+
+print(f"    Feature stats (treino normalizado):")
+print(f"    {'Feature':<14} {'Média':>8} {'Std':>8}")
+print(f"    {'-'*32}")
+for nome, m, s in zip(FEATURE_NAMES, mean_tr, std_tr):
+    print(f"    {nome:<14} {m:>8.4f} {s:>8.4f}")
+
+# Salva parâmetros de normalização para uso em produção
+norm_params = {"mean": mean_tr.tolist(), "std": std_tr.tolist(),
+               "features": FEATURE_NAMES}
+import json
+with open("/mnt/user-data/outputs/norm_params_bloco1b.json", "w") as f:
+    json.dump(norm_params, f, indent=2)
+print(f"\n    ✅ Parâmetros salvos em norm_params_bloco1b.json")
+print(f"       (CARREGAR no bot na inferência — não recalcular!)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 5 — BASELINE BURRO  (Chollet 10.2: "always start with a naive baseline")
+# ══════════════════════════════════════════════════════════════════════════════
+# Antes de qualquer modelo, precisamos saber o que é "ganhar por acaso".
+# Se o baseline já tem 60% de acurácia, nosso modelo precisa superar isso.
+
+print(f"\n[5] BASELINE BURRO (Chollet 10.2 — sempre compare com o mais simples)")
+
+# Baseline 1: chuta sempre UP (classe majoritária)
+baseline_sempre_up = y_test.mean()
+# Baseline 2: regra atual do bot (squeeze + delta >= 0.70 → UP)
+idx_sniper = (X_test[:, 2] == 1) & (X_test[:, 3] >= 0.70)  # squeeze & delta_buy
+y_pred_regras = np.where(idx_sniper, 1.0, 0.0)
+# Para amostras sem squeeze, usa delta_buy > 0.5 como desempate
+sem_squeeze = ~idx_sniper
+y_pred_regras[sem_squeeze] = (X_test[sem_squeeze, 3] > 0.5).astype(float)
+acc_regras = (y_pred_regras == y_test).mean()
+
+print(f"    Baseline 1 — sempre UP          : {baseline_sempre_up*100:.1f}%")
+print(f"    Baseline 2 — regras if/else bot : {acc_regras*100:.1f}%")
+print(f"    → Nosso modelo DL precisa superar {max(baseline_sempre_up, acc_regras)*100:.1f}%")
+print(f"       para justificar a complexidade.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 6 — ARQUITETURA DO MODELO  (Chollet 4.1.3, 5.4.4)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 4.1.3: "In a binary classification problem, your model should end
+# with a Dense layer with one unit and a sigmoid activation."
+#
+# Chollet 5.4.4 (Dropout): "one of the most effective and most commonly used
+# regularization techniques for neural networks."
+# "applied to a layer, consists of randomly dropping out a number of output
+# features during training" — taxa típica: 0.2 a 0.5.
+
+print(f"\n[6] MODELO — Dense + Dropout (Chollet 4.1.3 + 5.4.4)")
+
+N_FEATURES = X_train_n.shape[1]
+
+def criar_modelo(dropout_rate=0.3, n_units_1=64, n_units_2=32):
+    """
+    Arquitetura: Dense → Dropout → Dense → Dropout → sigmoid
+    Conectada ao bot:
+      - input_shape=(7,) = 7 features do radar (versão flat, sem janela temporal)
+      - sigmoid → P(UP) ∈ [0, 1]
+      - binary_crossentropy = loss padrão para classificação binária (Chollet 4.1.3)
+    No Bloco 1.C, a camada Dense será trocada por LSTM para capturar
+    a janela temporal de 50 velas.
+    """
+    model = keras.Sequential([
+        # Camada 1: aprende combinações de features (BBW × delta, squeeze patterns)
+        layers.Dense(n_units_1, activation="relu",
+                     input_shape=(N_FEATURES,),
+                     name="dense_1"),
+        # Dropout: zera 30% dos neurônios aleatoriamente em cada batch de treino.
+        # Impede que o modelo "memorize" padrões específicos do treino.
+        # (Chollet: "break up happenstance patterns that aren't significant")
+        layers.Dropout(dropout_rate, name="dropout_1"),
+
+        # Camada 2: refinamento das representações
+        layers.Dense(n_units_2, activation="relu", name="dense_2"),
+        layers.Dropout(dropout_rate, name="dropout_2"),
+
+        # Saída: P(UP) — um neurônio com sigmoid
+        # sigmoid(x) = 1/(1+e^-x) → sempre em [0,1] → interpretável como probabilidade
+        layers.Dense(1, activation="sigmoid", name="saida"),
+    ], name="classificador_up_down_bot")
+
+    model.compile(
+        # Adam = SGD com momentum adaptativo — "a usually good default" (Chollet 4.1.3)
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        # binary_crossentropy: mede distância entre P(UP) previsto e rótulo real (0 ou 1)
+        # Equivalente a -[y·log(p) + (1-y)·log(1-p)]
+        loss="binary_crossentropy",
+        metrics=[
+            "accuracy",
+            # AUC: mais robusto que accuracy quando as classes estão desequilibradas
+            keras.metrics.AUC(name="auc"),
+        ],
+    )
+    return model
+
+model = criar_modelo()
+
+print()
+model.summary()
+
+print(f"""
+  Por que essa arquitetura para o bot:
+    Dense(64)  → aprende: "squeeze alto + delta_buy alto = pressão compradora"
+    Dropout(0.3) → não memoriza padrões de treino específicos (generaliza)
+    Dense(32)  → refina a representação
+    Dense(1, sigmoid) → P(UP) — probabilidade de a vela subir
+
+  Próximo (Bloco 1.C): a entrada flat (7,) vira janela temporal (50, 7) → LSTM
+""")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 7 — K-FOLD TEMPORAL  (Chollet 5.2, 5.3)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 5.3: "K-fold validation: split your data into K partitions.
+# For each partition i, train on the remaining K-1 partitions and evaluate."
+#
+# ⚠️  K-FOLD TEMPORAL (não aleatório!):
+# Para séries temporais, cada fold deve ser uma fatia CRONOLÓGICA.
+# Fold 1: treina em [0..20%], valida em [20%..40%]
+# Fold 2: treina em [0..40%], valida em [40%..60%]
+# ... (walk-forward — o Kaabar chama de "expanding window")
+# Isso simula como o modelo será usado em produção: sempre prevê o futuro.
+
+print(f"\n[7] K-FOLD TEMPORAL (Walk-Forward — sem shuffle)")
+
+K_FOLDS = 5
+fold_size = len(X_train_n) // K_FOLDS
+scores_acc = []
+scores_auc = []
+
+for fold in range(K_FOLDS):
+    # Split: treina em [0..fold*size], valida em [fold*size..(fold+1)*size]
+    i_inicio = 0
+    i_fim_tr = (fold + 1) * fold_size
+    i_fim_vl = min(i_fim_tr + fold_size, len(X_train_n))
+
+    if i_fim_tr >= len(X_train_n) or i_fim_vl <= i_fim_tr:
+        break
+
+    X_f_tr, y_f_tr = X_train_n[i_inicio:i_fim_tr], y_train[i_inicio:i_fim_tr]
+    X_f_vl, y_f_vl = X_train_n[i_fim_tr:i_fim_vl], y_train[i_fim_tr:i_fim_vl]
+
+    if len(X_f_tr) < 20 or len(X_f_vl) < 10:
+        continue
+
+    # Modelo limpo para cada fold
+    m_fold = criar_modelo()
+    m_fold.fit(
+        X_f_tr, y_f_tr,
+        epochs=30,
+        batch_size=32,
+        verbose=0,
+    )
+    res = m_fold.evaluate(X_f_vl, y_f_vl, verbose=0)
+    # res = [loss, accuracy, auc]
+    acc_f = res[1]
+    auc_f = res[2]
+    scores_acc.append(acc_f)
+    scores_auc.append(auc_f)
+    n_tr = len(X_f_tr)
+    n_vl = len(X_f_vl)
+    print(f"    Fold {fold+1}/{K_FOLDS}: "
+          f"train={n_tr:>4}  val={n_vl:>4}  "
+          f"acc={acc_f*100:.1f}%  auc={auc_f:.3f}")
+
+print(f"\n    K-Fold Results:")
+print(f"    Accuracy: {np.mean(scores_acc)*100:.1f}% ± {np.std(scores_acc)*100:.1f}%")
+print(f"    AUC:      {np.mean(scores_auc):.3f} ± {np.std(scores_auc):.3f}")
+
+# Interpretação (Chollet 5.2.1)
+if np.std(scores_acc) > 0.08:
+    print(f"    ⚠️  Alta variância entre folds (std={np.std(scores_acc)*100:.1f}%) → "
+          f"poucos dados ou não-estacionariedade.")
+elif np.mean(scores_acc) < max(baseline_sempre_up, acc_regras) + 0.02:
+    print(f"    ⚠️  Modelo não supera baseline — revise features ou aumente dados.")
+else:
+    print(f"    ✅  Modelo estável e acima do baseline.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 8 — TREINO FINAL  (Chollet 4.1.4 com EarlyStopping)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 4.1.4: "it's standard practice to reserve a subset of the training
+# data as validation data."
+# Chollet 5.4.3: "EarlyStopping callback — interrupt training as soon as
+# validation metrics have stopped improving."
+
+print(f"\n[8] TREINO FINAL (com EarlyStopping e monitoramento de overfitting)")
+
+model_final = criar_modelo()
+
+callbacks = [
+    # Salva os melhores pesos (baseado em val_loss, não val_accuracy)
+    # val_loss é mais estável — accuracy tem granularidade ruim com poucos dados
+    keras.callbacks.ModelCheckpoint(
+        "/mnt/user-data/outputs/melhor_modelo_bloco1b.keras",
+        monitor="val_loss",
+        save_best_only=True,
+        verbose=0,
+    ),
+    # Para quando val_loss não melhora por 10 épocas consecutivas
+    keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=10,
+        restore_best_weights=True,
+        verbose=1,
+    ),
+    # Reduz learning rate quando val_loss estagna (Chollet 7 — adiantando)
+    keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=0,
+    ),
+]
+
+t0 = time.time()
+historico = model_final.fit(
+    X_train_n, y_train,
+    epochs=100,           # EarlyStopping vai parar antes
+    batch_size=32,
+    validation_data=(X_val_n, y_val),
+    callbacks=callbacks,
+    verbose=0,
+)
+elapsed = time.time() - t0
+
+epocas_treinadas = len(historico.history["loss"])
+print(f"\n    Épocas treinadas    : {epocas_treinadas} (de 100 máx)")
+print(f"    Tempo de treino     : {elapsed:.1f}s")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 9 — DIAGNÓSTICO DE OVERFITTING  (Chollet 5.1 + 5.2)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet 5.1: "After a fourth epoch, you're over-optimizing on the training
+# data, and you end up learning representations that are specific to the
+# training data and don't generalize."
+#
+# Diagnóstico padrão:
+#   GAP grande (train_acc - val_acc) > 10% → overfitting
+#   val_acc < train_acc mas gap pequeno   → generalização OK
+#   val_acc ≈ train_acc ≈ baseline        → underfitting
+
+print(f"\n[9] DIAGNÓSTICO DE OVERFITTING")
+
+hist = historico.history
+train_acc_final = hist["accuracy"][-1]
+val_acc_final   = hist["val_accuracy"][-1]
+train_loss_f    = hist["loss"][-1]
+val_loss_f      = hist["val_loss"][-1]
+melhor_ep       = int(np.argmin(hist["val_loss"])) + 1
+
+print(f"\n    Épocas até parar : {epocas_treinadas}")
+print(f"    Melhor época     : {melhor_ep}")
+print(f"    Train  acc / loss: {train_acc_final*100:.1f}%  /  {train_loss_f:.4f}")
+print(f"    Val    acc / loss: {val_acc_final*100:.1f}%  /  {val_loss_f:.4f}")
+
+gap = train_acc_final - val_acc_final
+print(f"\n    Gap train/val    : {gap*100:+.1f}%")
+
+if gap > 0.12:
+    diag_over = ("🔴 OVERFITTING severo — modelo memorizou o treino.\n"
+                 "        Ação: aumentar Dropout (0.4→0.5), reduzir Dense units, "
+                 "mais dados.")
+elif gap > 0.06:
+    diag_over = ("🟡 OVERFITTING leve — normal com dados financeiros escassos.\n"
+                 "        Ação: tentar Dropout 0.35, aguardar mais dados do CSV.")
+elif val_acc_final < max(baseline_sempre_up, acc_regras) + 0.01:
+    diag_over = ("🟠 UNDERFITTING — modelo não supera baseline.\n"
+                 "        Ação: mais features, mais dados, ou modelo maior.")
+else:
+    diag_over = ("🟢 GENERALIZAÇÃO OK — gap razoável, modelo acima do baseline.")
+
+print(f"    Diagnóstico      : {diag_over}")
+
+# Curvas de aprendizado em texto (sem matplotlib — roda em qualquer ambiente)
+print(f"\n    Curva de aprendizado (loss por época):")
+print(f"    {'Ep':>4} {'Train Loss':>11} {'Val Loss':>10} {'Diagnóstico':>15}")
+print(f"    {'-'*45}")
+n_mostrar = min(epocas_treinadas, 20)
+step = max(1, epocas_treinadas // n_mostrar)
+for ep in range(0, epocas_treinadas, step):
+    tl = hist["loss"][ep]
+    vl = hist["val_loss"][ep]
+    flag = "← melhor" if (ep + 1) == melhor_ep else ""
+    gap_ep = tl - vl
+    status = "overfit" if gap_ep > 0.08 else ("underfit" if tl > 0.68 else "ok")
+    print(f"    {ep+1:>4} {tl:>11.4f} {vl:>10.4f}  {status:>12} {flag}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 10 — AVALIAÇÃO FINAL NO TESTE  (Chollet 5.2.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Chollet: "test dataset — your model shouldn't have had access to any
+# information about the test set, even indirectly."
+# Usamos o modelo com os melhores pesos (restaurados pelo EarlyStopping).
+
+print(f"\n[10] AVALIAÇÃO FINAL NO CONJUNTO DE TESTE (dados mais recentes)")
+
+test_loss, test_acc, test_auc = model_final.evaluate(
+    X_test_n, y_test, verbose=0)
+
+print(f"    Test  accuracy: {test_acc*100:.1f}%")
+print(f"    Test  AUC     : {test_auc:.3f}")
+print(f"    Test  loss    : {test_loss:.4f}")
+
+print(f"\n    Comparação com baselines:")
+print(f"    {'Método':<30} {'Accuracy':>10}")
+print(f"    {'-'*42}")
+print(f"    {'Baseline — sempre UP':<30} {baseline_sempre_up*100:>9.1f}%")
+print(f"    {'Baseline — regras if/else bot':<30} {acc_regras*100:>9.1f}%")
+print(f"    {'Dense + Dropout (este modelo)':<30} {test_acc*100:>9.1f}%")
+
+if test_acc > max(baseline_sempre_up, acc_regras) + 0.02:
+    veredicto = "✅ Modelo supera baselines → candidato a substituir decidir_estrategia()"
+else:
+    veredicto = "❌ Modelo ainda não supera baseline → treinar com mais dados"
+print(f"\n    {veredicto}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 11 — FUNÇÃO decidir_com_dl() — INTEGRAÇÃO NO BOT
+# ══════════════════════════════════════════════════════════════════════════════
+# Esta é a função que substitui decidir_estrategia() no coordinator_radar().
+# Recebe o mesmo dict que o radar já calcula, retorna a mesma string.
+# Thread-safe: model.predict() é stateless (não altera pesos).
+
+print(f"\n[11] INTEGRAÇÃO — decidir_com_dl() (drop-in para decidir_estrategia())")
+
+# Carrega o modelo salvo (melhor checkpoint)
+try:
+    modelo_producao = keras.models.load_model(
+        "/mnt/user-data/outputs/melhor_modelo_bloco1b.keras")
+    print(f"    ✅ Modelo carregado do checkpoint.")
+except Exception as e:
+    modelo_producao = model_final
+    print(f"    ⚠️  Usando modelo em memória ({e})")
+
+# Parâmetros de normalização (carregados do JSON em produção)
+NORM_MEAN = np.array(norm_params["mean"], dtype=np.float32)
+NORM_STD  = np.array(norm_params["std"],  dtype=np.float32)
+FEAT_NOMES = norm_params["features"]
+
+def decidir_com_dl(asset: str, radar_dict: dict,
+                   threshold_up: float = 0.60,
+                   threshold_down: float = 0.40) -> str:
+    """
+    Substitui decidir_estrategia() no coordinator_radar().
+
+    Parâmetros:
+      asset       : 'BTC' | 'ETH' | 'SOL'
+      radar_dict  : o dict que decidir_radar() já retorna (bbw, bbw_perc, etc.)
+      threshold_up  : P(UP) >= threshold_up  → SNIPER_UP
+      threshold_down: P(UP) <= threshold_down → SNIPER_DOWN
+      (zona entre threshold_down e threshold_up → SEM_SINAL)
+
+    Retorna: "SNIPER_UP" | "SNIPER_DOWN" | "SEM_SINAL"
+
+    Latência alvo: < 100ms (testado na seção 12)
+    """
+    try:
+        # Monta vetor de features na mesma ordem usada no treino
+        bbw        = float(radar_dict.get("bbw_atual",     0.0))
+        bbw_perc   = float(radar_dict.get("bbw_percentil", 50.0))
+        squeeze    = float(radar_dict.get("squeeze",       False))
+        delta_buy  = float(radar_dict.get("delta_buy",     0.5))
+        delta_sell = 1.0 - delta_buy
+        delta_ratio= delta_buy / (delta_sell + 1e-8)
+        bbw_norm   = bbw * bbw_perc / 100.0
+
+        feat_vec = np.array([[bbw, bbw_perc, squeeze, delta_buy,
+                              delta_sell, delta_ratio, bbw_norm]],
+                            dtype=np.float32)
+
+        # Normalização com parâmetros do TREINO (não recalcula)
+        feat_norm = (feat_vec - NORM_MEAN) / NORM_STD
+
+        # Inferência (o Keras não altera pesos em predict — thread-safe)
+        prob_up = float(modelo_producao.predict(feat_norm, verbose=0)[0, 0])
+
+        # Zona de incerteza → SEM_SINAL (o bot pula a vela)
+        if prob_up >= threshold_up:
+            return "SNIPER_UP"
+        elif prob_up <= threshold_down:
+            return "SNIPER_DOWN"
+        else:
+            return "SEM_SINAL"
+
+    except Exception as e:
+        # Fallback seguro: nunca trava o coordinator_radar()
+        return "SEM_SINAL"
+
+
+# ── Teste de latência (requisito do bot: < 100ms no T-10s) ──────────────────
+print(f"\n[12] TESTE DE LATÊNCIA (requisito: < 100ms para o coordinator_radar)")
+
+# Simula o dict que decidir_radar() retorna
+radar_exemplo = {
+    "bbw_atual":     0.0423,
+    "bbw_percentil": 15.0,     # squeeze!
+    "squeeze":       True,
+    "delta_buy":     0.72,     # pressão compradora
+    "diagnostico":   "BBW=0.042 (perc=15%, squeeze=SIM) | Delta_Buy=72%",
+}
+
+# Warm-up (primeira chamada do TF é mais lenta por JIT)
+_ = decidir_com_dl("BTC", radar_exemplo)
+
+# Medição real
+N_RUNS = 50
+tempos = []
+for _ in range(N_RUNS):
+    t = time.perf_counter()
+    resultado = decidir_com_dl("BTC", radar_exemplo)
+    tempos.append((time.perf_counter() - t) * 1000)
+
+lat_media = np.mean(tempos)
+lat_p99   = np.percentile(tempos, 99)
+
+print(f"    Resultado         : {resultado}")
+print(f"    P(UP) (exemplo)   : {float(modelo_producao.predict((np.array([[radar_exemplo['bbw_atual'], radar_exemplo['bbw_percentil'], 1.0, radar_exemplo['delta_buy'], 0.28, radar_exemplo['delta_buy']/0.28, radar_exemplo['bbw_atual']*radar_exemplo['bbw_percentil']/100]]) - NORM_MEAN) / NORM_STD, verbose=0)[0,0]):.4f}")
+print(f"    Latência média    : {lat_media:.2f}ms (N={N_RUNS})")
+print(f"    Latência p99      : {lat_p99:.2f}ms")
+
+if lat_p99 < 100:
+    print(f"    ✅ Dentro do limite de 100ms — ok para produção.")
+else:
+    print(f"    ⚠️  Latência p99 excede 100ms — otimizar com TFLite ou .pb.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEÇÃO 13 — COMO INTEGRAR NO BOT (código de cola)
+# ══════════════════════════════════════════════════════════════════════════════
+
+print(f"""
+{'=' * 72}
+  COMO INTEGRAR NO bot_assimetria_15.py
+{'=' * 72}
+
+  # No topo do bot (imports):
+  from tensorflow import keras
+  import numpy as np, json
+
+  # Variáveis globais (carregadas uma vez no startup):
+  _dl_model = keras.models.load_model("melhor_modelo_bloco1b.keras")
+  _dl_norm  = json.load(open("norm_params_bloco1b.json"))
+  _dl_mean  = np.array(_dl_norm["mean"], dtype=np.float32)
+  _dl_std   = np.array(_dl_norm["std"],  dtype=np.float32)
+
+  # Substituição em coordinator_radar() — PASSE 2:
+  # Troque a chamada de decidir_estrategia() por decidir_com_dl()
+  #
+  # ANTES:
+  #   _decisoes[asset] = decidir_estrategia(asset, _deltas_atuais)
+  #
+  # DEPOIS (modo DL):
+  #   _decisoes[asset] = decidir_com_dl(asset, _radares[asset])
+  #
+  # Modo A/B: rode ambas em paralelo durante 30 dias para comparar.
+  # Compare: win_rate DL vs win_rate regras fixas por ativo.
+""")
+
+print(f"""
+{'=' * 72}
+  RESUMO BLOCO 1.B — O que foi construído
+{'=' * 72}
+
+  Cap. 3 (Keras):
+    Projeto estruturado do zero: carga → features → split → model → eval
+    API moderna: from tensorflow import keras | from tensorflow.keras import layers
+
+  Cap. 4 (Classificação Binária):
+    Target: y = 1 se UP, 0 se DOWN (oráculo Binance — fonte da verdade)
+    Arquitetura: Dense(64) → Dropout → Dense(32) → Dropout → sigmoid
+    Loss: binary_crossentropy | Optimizer: Adam
+    Saída: P(UP) ∈ [0, 1] → limiar 0.60/0.40 → SNIPER_UP/DOWN/SEM_SINAL
+
+  Cap. 5 (Fundamentos de ML):
+    Split TEMPORAL (não aleatório) — treino < val < teste cronologicamente
+    K-Fold walk-forward — simula produção: sempre prevê o futuro
+    EarlyStopping — para no melhor val_loss, restaura melhores pesos
+    Dropout — regularização para dados financeiros escassos
+    Diagnóstico overfitting — gap train/val com interpretação automática
+
+  Arquivo gerado:
+    melhor_modelo_bloco1b.keras  → pesos do modelo (carrega no bot)
+    norm_params_bloco1b.json    → médias/std para normalização em produção
+
+  PRÓXIMO PASSO — Bloco 1.C (Cap. 10):
+    Substituir Dense(64) por LSTM(64, input_shape=(50, 7))
+    Janela temporal de 50 velas × 7 features (12.5h de contexto)
+    Capturar padrões sequenciais: "3 velas de compra + squeeze = rompimento"
+{'=' * 72}
+""")
