@@ -17,11 +17,20 @@ import os
 
 def gerar_dados_sinteticos(n=3000):
     np.random.seed(42)
-    # 7 features: open, high, low, close, volume, bbw, delta_buy
-    X_raw = np.random.randn(n, 7).astype(np.float32)
-    # y target rules based on some features (simplified)
-    # y = 1 if delta_buy > 0.5 and bbw > 0, else 0
-    y = ((X_raw[:, 6] > 0.5) & (X_raw[:, 5] > 0.0)).astype(np.float32)
+    # Generate realistic scales
+    # open, high, low, close ~ 42000
+    prices = 42000 + np.random.randn(n, 4) * 500
+    # volume ~ 1200
+    volume = np.abs(1200 + np.random.randn(n, 1) * 300)
+    # bbw ~ 0.04
+    bbw = np.abs(0.04 + np.random.randn(n, 1) * 0.01)
+    # delta_buy ~ 0 to 1
+    delta_buy = np.clip(0.5 + np.random.randn(n, 1) * 0.2, 0, 1)
+
+    X_raw = np.hstack([prices, volume, bbw, delta_buy]).astype(np.float32)
+
+    # Independent label generation
+    y = np.random.choice([0, 1], size=n).astype(np.float32)
     return X_raw, y
 
 def criar_janelas(X_norm, y, n_janela=50):
@@ -39,10 +48,10 @@ def main():
         print("Carregando dados de logs/radar_velas.csv...")
         try:
             df = pd.read_csv("logs/radar_velas.csv")
-            # Assumindo as 7 colunas: open, high, low, close, volume, bbw, delta_buy
+            df = df[df["vela_dir"].isin(["UP", "DOWN"])]
+            y_raw = (df["vela_dir"] == "UP").astype(np.float32).values
             features = ["open", "high", "low", "close", "volume", "bbw", "delta_buy"]
             X_raw = df[features].values.astype(np.float32)
-            y_raw = ((X_raw[:, 6] > 0.5) & (X_raw[:, 5] > 0.0)).astype(np.float32)
         except Exception as e:
             print(f"Erro ao ler CSV: {e}. Usando fallback.")
             X_raw, y_raw = gerar_dados_sinteticos(n=3000)
@@ -194,15 +203,23 @@ if __name__ == "__main__":
     main()
 
 # Carregados UMA VEZ no startup do bot (thread-safe: predict() é stateless)
-try:
-    _modelo = keras.models.load_model("models/lstm_v1.keras")
-    _norm   = json.load(open("models/norm_params_bloco1c.json"))
-    _mean   = np.array(_norm["mean"], dtype=np.float32)
-    _std    = np.array(_norm["std"],  dtype=np.float32)
-except Exception:
-    _modelo = None
-    _mean = None
-    _std = None
+_modelo = None
+_mean = None
+_std = None
+
+def inicializar_modelo():
+    global _modelo, _mean, _std
+    try:
+        _modelo = keras.models.load_model("models/lstm_v1.keras")
+        _norm   = json.load(open("models/norm_params_bloco1c.json"))
+        _mean   = np.array(_norm["mean"], dtype=np.float32)
+        _std    = np.array(_norm["std"],  dtype=np.float32)
+        print("Modelo e parâmetros de normalização inicializados com sucesso.")
+    except Exception as e:
+        print(f"Erro ao inicializar modelo: {e}")
+        _modelo = None
+        _mean = None
+        _std = None
 
 def decidir_com_dl(asset: str, df_janela: np.ndarray,
                    threshold_up=0.60, threshold_down=0.40) -> str:
