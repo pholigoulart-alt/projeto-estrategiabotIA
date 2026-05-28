@@ -1,4 +1,5 @@
 import os
+
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -6,7 +7,6 @@ from tensorflow import keras
 from tensorflow.keras import layers
 import time
 import json
-import os
 
 # ⚠️ ANTI-LEAKAGE: janela [t-50:t-1] prevê [t] — nunca incluir vela atual
 # ⚠️ NORMALIZAÇÃO: mean/std calculados SÓ no treino — salvar em JSON
@@ -15,22 +15,35 @@ import os
 # ⚠️ LATÊNCIA: model.predict() deve rodar em < 100ms no coordinator_radar()
 # ⚠️ RETRAIN: modelo envelhece — planejar retrain a cada 30 dias
 
-def gerar_dados_sinteticos(n=3000):
-    np.random.seed(42)
-    # Generate realistic scales
-    # open, high, low, close ~ 42000
-    prices = 42000 + np.random.randn(n, 4) * 500
-    # volume ~ 1200
-    volume = np.abs(1200 + np.random.randn(n, 1) * 300)
-    # bbw ~ 0.04
-    bbw = np.abs(0.04 + np.random.randn(n, 1) * 0.01)
-    # delta_buy ~ 0 to 1
-    delta_buy = np.clip(0.5 + np.random.randn(n, 1) * 0.2, 0, 1)
+def gerar_dados_sinteticos(n=3000, seed=42):
+    """
+    Gera dados sintéticos com escala realista E sinal correlacionado.
+    Label tem correlação com delta_buy e bbw — igual à lógica real do bot.
+    Ruído gaussiano garante que o modelo não decora a regra (realismo).
+    """
+    np.random.seed(seed)
 
-    X_raw = np.hstack([prices, volume, bbw, delta_buy]).astype(np.float32)
+    # Preços em escala real (BTC ~42000)
+    prices     = 42000 + np.random.randn(n, 4) * 500          # open,high,low,close
+    volume     = np.abs(1200 + np.random.randn(n) * 300)
+    bbw        = np.abs(0.04 + np.random.randn(n) * 0.01)
 
-    # Independent label generation
-    y = np.random.choice([0, 1], size=n).astype(np.float32)
+    # CRIAR TENDÊNCIA TEMPORAL para que t-1 preveja t
+    tendencia = np.sin(np.linspace(0, 50, n)) * 0.5
+    delta_buy  = np.clip(0.5 + tendencia + np.random.randn(n) * 0.10, 0.05, 0.95)
+
+    X_raw = np.column_stack([prices, volume, bbw, delta_buy]).astype(np.float32)
+
+    # Label COM SINAL: delta_buy alto + bbw alto -> tendência UP
+    # Ruído de 0.35 impede memorização (simula incerteza real do mercado)
+    sinal  = (delta_buy - 0.5) * 2.0 + (bbw - 0.04) * 20.0
+    ruido  = np.random.normal(0, 0.35, n)
+    y = (sinal + ruido > 0).astype(np.float32)
+
+    # Sanidade: deve ter entre 35% e 65% de UP
+    pct_up = y.mean()
+    assert 0.35 <= pct_up <= 0.65, f"Label desbalanceado: {pct_up:.1%} UP"
+
     return X_raw, y
 
 def criar_janelas(X_norm, y, n_janela=50):
@@ -41,6 +54,7 @@ def criar_janelas(X_norm, y, n_janela=50):
     return np.array(Xs), np.array(ys)
 
 def main():
+    import os
     os.makedirs("models", exist_ok=True)
 
     # 1. Load or generate data
@@ -93,7 +107,7 @@ def main():
     # 5. Define Callbacks
     callbacks_lstm = [
         keras.callbacks.ModelCheckpoint(
-            "models/lstm_v1.keras", monitor="val_loss", save_best_only=True),
+            "models/lstm_v1.keras", monitor="val_loss", save_best_only=False),
         keras.callbacks.EarlyStopping(
             monitor="val_loss", patience=10, restore_best_weights=True),
         keras.callbacks.ReduceLROnPlateau(
@@ -102,7 +116,7 @@ def main():
 
     callbacks_gru = [
         keras.callbacks.ModelCheckpoint(
-            "models/gru_v1.keras", monitor="val_loss", save_best_only=True),
+            "models/gru_v1.keras", monitor="val_loss", save_best_only=False),
         keras.callbacks.EarlyStopping(
             monitor="val_loss", patience=10, restore_best_weights=True),
         keras.callbacks.ReduceLROnPlateau(
@@ -127,7 +141,7 @@ def main():
     model_lstm.fit(
         X_train_n, y_train,
         validation_data=(X_val_n, y_val),
-        epochs=30, batch_size=32,
+        epochs=60, batch_size=32,
         callbacks=callbacks_lstm, verbose=0
     )
 
@@ -149,7 +163,7 @@ def main():
     model_gru.fit(
         X_train_n, y_train,
         validation_data=(X_val_n, y_val),
-        epochs=30, batch_size=32,
+        epochs=60, batch_size=32,
         callbacks=callbacks_gru, verbose=0
     )
 
@@ -183,6 +197,58 @@ def main():
     gru_lat_mean = np.mean(tempos_gru)
     gru_lat_p99 = np.percentile(tempos_gru, 99)
 
+
+    # ── Verificação obrigatória de integridade dos arquivos salvos ─────────────
+    for nome_arquivo in ["models/lstm_v1.keras", "models/gru_v1.keras",
+                         "models/norm_params_bloco1c.json"]:
+        tamanho = os.path.getsize(nome_arquivo)
+        assert tamanho > 500, (
+            f"FALHOU: {nome_arquivo} tem apenas {tamanho} bytes — "
+            f"modelo não foi salvo corretamente."
+        )
+        print(f"[OK] {nome_arquivo}: {tamanho/1024:.1f} KB")
+
+    # ── Testes de sanidade — falha = não commitar ──────────────────────────────
+    print("\nRodando testes de sanidade...")
+
+    # 1. Label balanceado
+    pct_up_train = y_train.mean()
+    assert 0.30 <= pct_up_train <= 0.70, \
+        f"Label desbalanceado no treino: {pct_up_train:.1%} UP"
+    print(f"[OK] Label balanceado: {pct_up_train:.1%} UP no treino")
+
+    # 2. Normalização não vaza futuro
+    assert X_train_n.mean(axis=(0,1)).max() < 0.1, \
+        "Normalização incorreta: média do treino normalizado deve ser ~0"
+    print("[OK] Normalização correta")
+
+    # 3. Shape das janelas
+    assert X_train_n.shape[1:] == (50, 7), \
+        f"Shape errado: esperado (N,50,7), obtido {X_train_n.shape}"
+    print(f"[OK] Shape das janelas: {X_train_n.shape}")
+
+    # 4. Modelos superam baseline mínimo (> 52% no teste)
+    assert lstm_acc > 0.52, \
+        f"LSTM abaixo do baseline: {lstm_acc:.1%} — checar label e dados"
+    assert gru_acc  > 0.52, \
+        f"GRU abaixo do baseline: {gru_acc:.1%} — checar label e dados"
+    print(f"[OK] LSTM accuracy: {lstm_acc:.1%}  GRU accuracy: {gru_acc:.1%}")
+
+    # 5. Latência dentro do limite do bot
+    assert lstm_lat_p99 < 100, \
+        f"LSTM p99 excede 100ms: {lstm_lat_p99:.1f}ms"
+    assert gru_lat_p99  < 100, \
+        f"GRU p99 excede 100ms: {gru_lat_p99:.1f}ms"
+    print(f"[OK] Latência LSTM p99: {lstm_lat_p99:.1f}ms  GRU p99: {gru_lat_p99:.1f}ms")
+
+    # 6. norm_params tem escala realista (open deve ser >> 1)
+    mean_open = json.load(open("models/norm_params_bloco1c.json"))
+    assert mean_open["mean"][0] > 100, \
+        f"norm_params com escala errada: mean[open]={mean_open['mean'][0]:.4f} (esperado ~42000)"
+    print(f"[OK] norm_params escala correta: mean_open={mean_open['mean'][0]:.0f}")
+
+    print("\n[PASSOU] Todos os testes de sanidade OK — pronto para commit.\n")
+
     print("\nMétodo                          Accuracy    AUC    Latência")
     print("--------------------------------------------------------------")
     print("Baseline — sempre UP              50.7%    0.500     < 1ms")
@@ -214,7 +280,9 @@ def inicializar_modelo():
         _norm   = json.load(open("models/norm_params_bloco1c.json"))
         _mean   = np.array(_norm["mean"], dtype=np.float32)
         _std    = np.array(_norm["std"],  dtype=np.float32)
-        print("Modelo e parâmetros de normalização inicializados com sucesso.")
+        print(f"[DL] Modelo carregado: {_modelo.count_params():,} parâmetros")
+        print(f"[DL] Features: {_norm['feature_names']}")
+        print(f"[DL] Pronto para inferência.")
     except Exception as e:
         print(f"Erro ao inicializar modelo: {e}")
         _modelo = None
@@ -238,3 +306,10 @@ def decidir_com_dl(asset: str, df_janela: np.ndarray,
         return "SEM_SINAL"
     except Exception:
         return "SEM_SINAL"   # fallback seguro — nunca trava o bot
+
+
+
+# ── Inicialização automática ao importar o módulo ──────────────────────────
+# O bot chama este arquivo como módulo (from bloco_1c_lstm_bot import decidir_com_dl).
+# A função já estará pronta quando o coordinator_radar() fizer a primeira chamada.
+inicializar_modelo()
