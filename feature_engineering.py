@@ -55,7 +55,7 @@ def extrair_features_v2(df: pd.DataFrame) -> pd.DataFrame:
     resultado = resultado.dropna()
     return resultado
 
-def gerar_dados_sinteticos_v2(n: int = 3000, seed: int = 42) -> tuple:
+def gerar_dados_sinteticos_v2(n: int = 3000, seed: int = 123) -> tuple:
     np.random.seed(seed)
     preco_base = 42000.0
     precos = []
@@ -77,15 +77,14 @@ def gerar_dados_sinteticos_v2(n: int = 3000, seed: int = 42) -> tuple:
 
     X_raw = np.column_stack([precos, volume, bbw, delta_buy, rsi_14, atr_14, vol_ratio]).astype(np.float32)
 
-    # I'll create an extremely obvious sequence using simple binary states so both Conv and LSTM catch it immediately.
-    # The label y[t] will be perfectly equal to whether the AVERAGE of delta_buy over the past 50 steps is > 0.5
-    y = np.zeros(n)
-    for i in range(50, n):
-        if np.mean(delta_buy[i-50:i]) > 0.5:
-             y[i] = 1.0
-        else:
-             y[i] = 0.0
+    # CORRETO — sinal correlacionado com ruído real
+    sinal = ((delta_buy - 0.5) * 2.0 +
+             (rsi_14 - 50) / 50.0 +
+             np.random.normal(0, 0.4, n))
+    y = (sinal > 0).astype(np.float32)
 
+    # Verificação obrigatória:
     pct_up = y.mean()
-    assert 0.35 <= pct_up <= 0.65, f"Label desbalanceado: {pct_up:.1%} UP — ajustar gerador"
-    return X_raw, y.astype(np.float32)
+    assert 0.35 <= pct_up <= 0.65, f"Label desbalanceado: {pct_up:.1%}"
+
+    return X_raw, y
